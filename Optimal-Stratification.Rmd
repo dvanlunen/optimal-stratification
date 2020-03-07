@@ -1,0 +1,276 @@
+---
+title: "Optimal-Stratification"
+output: html_notebook
+---
+
+Maximize the Power of your Experiments
+Use Optimal Stratified Random Assignment!
+
+by Dan VanLunen
+
+# Why this stuff is important
+
+Randomized experiments are the gold standard for causal inference: if you want to get an unbiased (the average value of your estimation method is the true value) estimate of an effect of a treatment, a randomized experiment is the best way to do so.
+
+But experiments are expensive and the more data you have to collect, the more costly they are. Using the methodology in this post, you can increase your experimental power so that you'll be able to measure an effect with less data and thus less $.
+
+# High Level Outline of the Approach
+This post outlines a method for [optimal stratification in randomized experiments](https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd=1&cad=rja&uact=8&ved=2ahUKEwiC-I_00P_nAhVOhOAKHaEBASUQFjAAegQIAhAC&url=https%3A%2F%2Fscholar.harvard.edu%2Ffiles%2Ftbarrios%2Ffiles%2Fopstratv17_0.pdf&usg=AOvVaw1NwZ4ew2X2CWugbWlzKEug).
+
+The strategy is as follows:
+
+1. Using pre-experiment covariates, build a model that predicts your outcome of interest.
+2. Sort your experimental units (level of your population you assign treatment at) by their predicted outcome from the model trained in the previous step.
+3. Randomly assign treatment to one of the two units with the highest predicted outcomes, and to oen of the two units with the third and fourth highest predicted outcomes, and so forth until you assign treatment to one of the two units with the lowest predicted outcomes.
+4. Then, to measure the effect of the treatment on the outcome regress outcome ~ b0 + b1 Treatment + b[2:N/2+1] pair_indicators.
+
+diagram.png
+pg 18 of https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd=1&cad=rja&uact=8&ved=2ahUKEwiC-I_00P_nAhVOhOAKHaEBASUQFjAAegQIAhAC&url=https%3A%2F%2Fscholar.harvard.edu%2Ffiles%2Ftbarrios%2Ffiles%2Fopstratv17_0.pdf&usg=AOvVaw1NwZ4ew2X2CWugbWlzKEug
+
+Inutitively, this is stratified random assignment where each stratum is a pair of experimental units that have very similar predicted values of the outcome of interest. Then, the coeficient on the treatment indicator in the final step is the impact of the treatment on the outcome.
+
+The remainder of this post will work through
+
+1. an example experiment to with toy data to make things concrete
+2. a regression spec to pick up the proportional effect we set in the data
+3. an application of the optimal stratification method showing it provides more power than just pure random assignment.
+
+
+# Example Experiment
+Let's say we own a company that specializes in dog travel. 
+
+https://pixabay.com/photos/dog-mountain-mombarone-clouds-190056/
+
+We want to measure the impact of a TV ad on our revenue. TV ads can be distributed to different geographic areas. In order to measure the impact of the TV ad, we can measure the difference between revenue from regions that we (i) displayed the TV ad in and (ii) did not display the TV ad in. 
+
+Let's build a toy data set to illustrate this example.
+
+The key elements of this data set are:
+- Revenue is associated with covariates: number of dogs and population.
+- Revenue in the experiment period also depends on revenue in the pre-period
+- Revenue in the experiment period is on average 1% higher if the region receives treatment. This is the effect we are trying to measure.
+
+```{r}
+library(tidyverse)
+library(modelr)
+set.seed(24)
+true_effect <- 0.01
+n_units <- 20000
+toy_data <- tibble(
+  region_id=1:n_units,
+  population=round(rnorm(n_units, mean=100000,sd=10000))
+) %>% 
+  mutate(
+    # pre period has non-linear relationship w population
+    pre_period_revenue=case_when(
+      # if higher than mean pop centered at 100 X sqrt(pop)
+      population>100000 ~ 100*(population)^.5,
+      # otherwise centers at pop^2
+      T ~ population^2) + 
+      # add a little noise to pre-period revenue
+      rnorm(n_units, sd=10),
+    # revenue during the experiment (not treated and treated)
+    #   only one of these will actually be observed
+    post_period_revenue_if_not_treated = pre_period_revenue*1.1 + rnorm(n_units, sd=10),
+    # if treated, on average revenue increases by true_effect*100%
+    post_period_revenue_if_treated = post_period_revenue_if_not_treated*(1 + true_effect) + rnorm(n_units, sd=10)
+  )
+```
+
+```{r}
+toy_data %>% summarise_all(min)
+```
+
+Next let's turn to a simple regression that can measure this treatment effect.
+
+# Measuring the Effect
+
+To measure the relative change in revenue we'll can use the following regression:
+
+$$log(Revenue_{region}) \sim \beta_0 + \beta_1 Treated_{region}$$
+Treated is 1 if the region received treatment and 0 otherwise. 
+
+Then, $\beta_1$ can be interpreted as the proportional impact of treatment on revenue: if a unit is given treatment, revenue will increase by $100(1-e^{\beta_1})\%\approx100\beta_1\%$. This is a good approximation for the range we expect beta1 to be in (near 1% in our toy data).
+
+Now, let's turn to the real aim of this post: how do we do our assignment to be able to measure this 1% effect as precisely as possible?
+
+# Optimal Stratified Assignment
+
+The key question this post aims to solve is: how do we assign which geographies should get the ad (treatment) to get the data we need to estimate the impact of the ad as precisely as possible.
+
+As a first principle, we need assignment to be random. Otherwise, we'll likely get a biased measurement. For example, if we decided to send the ad to all the regions with the largest revenue in the pre-period, then when we ran the regression above, we would likely see a very large treatment effect because we were attributing the effect of having a larger pre-period revenue to the treatment. But if we randomize treatment, no such confounding variables can exist.
+
+But beyond that, how can we get more precision? Through stratified assignment where the strata have similar values of the outcome.
+
+## Stratified Assignment
+Let's make functions for each step of the process.
+
+1. Predict outcomes to assign pairs of units with similar predicted outcomes to strata
+2. Assign treatment randomly within strata
+
+First, let's make a function that uses a model to predict the outcome. Then, assigns pairs of units that have similar predicted outcomes to the same strata.
+
+```{r}
+optimal_strata <- function(
+  # data with features the model uses for predictions
+  data,
+  # model to make predictions for
+  model
+){
+  data %>%
+    # add a "pred" column to the data
+    # that is predictions from the model
+    add_predictions(model) %>% 
+    # sort the data by the predictions
+    arrange(-pred) %>% 
+    # add a column specifying the strata
+    mutate(
+      stratum_id=row_number() %/% 2 + row_number() %% 2
+           ) %>% 
+    # drop the predictions column
+    select(-pred)
+}
+```
+
+First, let's make a function that will do stratified random assignment. This function will take a tibble with a column that specifies the strata and a column that specifies the experiment units.
+
+Within each stratum, it will assign half of the units to treatment randomly.
+
+```{r}
+stratified_random_assignment <- function(
+  data, # data with units and strata
+  stratum_id, # column name that specifies strata
+  unit_id, # (optional) column name that specifies units
+  seed=42
+){
+  set.seed(seed)
+  # if no units specified, assume each row is a unit
+  if (missing(unit_id)){
+    unit_id <- "unit_name"
+    data <- data %>% mutate(unit_name=row_number())
+  }
+  
+  # do the assignment
+  data %>% 
+    # get the distinct statum-unit pairs
+    select(one_of(c(stratum_id, unit_id))) %>% 
+    distinct() %>% 
+    # randomize the order
+    sample_frac() %>% 
+    # within each stratum
+    group_by_at(stratum_id) %>% 
+    # assign treatment to half of the units
+    mutate(treated=(1 + row_number()) %% 2) %>% 
+    ungroup() %>% 
+    # add the treatment back to the original data
+    inner_join(data, by=c(unit_id, stratum_id))
+}
+```
+
+
+
+```{r}
+# model
+m <- lm(
+  log(pre_period_revenue) ~ log(population),
+  data=toy_data
+)
+
+toy_data_w_optimal_assignments <- toy_data %>% 
+  optimal_strata(m) %>% 
+  stratified_random_assignment("stratum_id") %>% 
+  # which outcome revenue we observe is dependent on
+  # whether treatment was given
+  mutate(
+    observed_exp_revenue=case_when(
+      treated == 1 ~ post_period_revenue_if_treated,
+      treated == 0 ~ post_period_revenue_if_not_treated
+    )
+  )
+  
+# measure the effect
+model_to_measure_the_effect <- lm(
+  log(observed_exp_revenue) ~ treated + as.factor(stratum_id),
+  data=toy_data_w_optimal_assignments
+)
+model_results <- summary(model_to_measure_the_effect)
+model_results$coefficients[2,1:2]
+
+```
+
+```{r}
+toy_data_w_random_assignments <- toy_data %>% 
+  sample_frac() %>% 
+  mutate(treated=row_number() %% 2) %>% 
+  # which outcome revenue we observe is dependent on
+  # whether treatment was given
+  mutate(
+    observed_exp_revenue=case_when(
+      treated == 1 ~ post_period_revenue_if_treated,
+      treated == 0 ~ post_period_revenue_if_not_treated
+    )
+  )
+
+# measure the effect
+model_to_measure_the_effect <- lm(
+  log(observed_exp_revenue) ~ treated,
+  data=toy_data_w_random_assignments
+)
+model_results <- summary(model_to_measure_the_effect)
+model_results$coefficients[2,1:2]
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Let's write the function to do the optimal assignment.
+
+
+
+
+# Why does this give us more power?
+If we meet some standard assumptions of ordinary least squares (the relationship between our outcome and covariates is linear, the units are not impacting each other, there is no correlation between the treatment and other covariates that impact the outcome, homoskedasticty) the variance of the OLS estimate of the coefficient on the treatment is:
+
+$$
+Var(\hat{\beta}_1) = \frac{\sigma^2}{(1-R^2_{-1})\sum_{regions}(Treated_{region} - \%Treated)^2}
+$$
+
+The numerator is the variance of the measurment error that we cannot control. The sum in the denominator is the total sample variation in the treatment. This can be maximized (and the higher it is the more precise our coefficient estimator is) by assigning half of the units to treatment.
+
+Finally, $R^2_{-1}$ represents the percent of the variation in the outcome that is explained by all the elements of our model *besides* the treatment (it is the $R^2$ if you run the regression with all the other covariates besides Treatment). In the model specification in the previous section, there was only a constant term besides the Treatment indicator. If we use stratified random assignment though, we can add indicators that will help explain the outcome, increase $R^2_{-1}$, and thus give us more precision.
+
+
+
+
+
+
+
